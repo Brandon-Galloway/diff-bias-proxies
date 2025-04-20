@@ -50,6 +50,21 @@ log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname
 logger.propagate = False
 
 
+def find_best_threshold(scores, labels, metric):
+    threshs = np.linspace(0, 1, 101)
+    if metric == 'balanced_accuracy':
+        scorer = balanced_accuracy_score
+    elif metric == 'accuracy':
+        scorer = accuracy_score
+    elif metric == 'f1_score':
+        scorer = f1_score
+    else:
+        raise ValueError(metric)
+    perf = [scorer(labels, scores > t) for t in threshs]
+    return threshs[int(np.argmax(perf))]
+
+
+
 def main(config):
     seeds = [np.random.randint(0, high=10000)]
     if 'seed' in config:
@@ -169,19 +184,7 @@ def main(config):
 
                     cnt += 1
 
-            threshs = np.linspace(0, 1, 101)
-            performances = []
-            for thresh in threshs:
-                if config['acc_metric'] == 'balanced_accuracy':
-                    perf = balanced_accuracy_score(val_labels, val_scores > thresh)
-                elif config['acc_metric'] == 'accuracy':
-                    perf = accuracy_score(val_labels, val_scores > thresh)
-                elif config['acc_metric'] == 'f1_score':
-                    perf = f1_score(val_labels, val_scores > thresh)
-                else:
-                    print('Accuracy metric not defined')
-                performances.append(perf)
-            best_thresh = threshs[np.argmax(performances)]
+            best_thresh = find_best_threshold(val_scores, val_labels, config['acc_metric'])
 
             logger.info('Evaluating default model with best threshold.')
             results_valid['default'] = get_valid_objective_(y_pred=(val_scores > best_thresh), y_val=val_labels,
@@ -193,6 +196,7 @@ def main(config):
             # Get rid of data loaders to free up memory
             dataloaders = None
             dataset_sizes = None
+            torch.cuda.empty_cache()
 
         # Evaluate random perturbation intra-processing
         if 'random' in config['models']:
@@ -228,19 +232,8 @@ def main(config):
                     model=rand_model, device=device, dataloader=dataloaders_rand['val'],
                     dataset_size=dataset_sizes_rand['val'], batch_size=config['default']['batch_size'])
 
-                threshs = np.linspace(0, 1, 101)
-                performances = []
-                for thresh in threshs:
-                    if config['acc_metric'] == 'balanced_accuracy':
-                        perf = balanced_accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'accuracy':
-                        perf = accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'f1_score':
-                        perf = f1_score(y_valid, valid_pred_scores > thresh)
-                    else:
-                        print('Accuracy metric not defined')
-                    performances.append(perf)
-                best_thresh = threshs[np.argmax(performances)]
+                best_thresh = find_best_threshold(valid_pred_scores, y_valid, config['acc_metric'])
+
                 best_obj = get_valid_objective_(y_pred=(valid_pred_scores > best_thresh), y_val=y_valid,
                                                 p_val=p_valid, config=config)
 
@@ -274,6 +267,11 @@ def main(config):
             results_test['random'] = get_test_objective_(y_pred=(test_pred_scores > best_thresh), y_test=y_test,
                                                            p_test=p_test, config=config)
             logger.info(f'Results test: {results_test["random"]}')
+
+            dataloaders_rand = None
+            dataset_sizes_rand = None
+            del rand_model, best_model
+            torch.cuda.empty_cache()
 
         # Evaluate the ROC post-processing
         if 'ROC' in config['models']:
@@ -310,19 +308,7 @@ def main(config):
                     model=model, device=device, dataloader=dataloaders_roc['test'],
                     dataset_size=dataset_sizes_roc['test'], batch_size=config['default']['batch_size'])
 
-                threshs = np.linspace(0, 1, 101)
-                performances = []
-                for thresh in threshs:
-                    if config['acc_metric'] == 'balanced_accuracy':
-                        perf = balanced_accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'accuracy':
-                        perf = accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'f1_score':
-                        perf = f1_score(y_valid, valid_pred_scores > thresh)
-                    else:
-                        print('Accuracy metric not defined')
-                    performances.append(perf)
-                best_thresh = threshs[np.argmax(performances)]
+                best_thresh = find_best_threshold(valid_pred_scores, y_valid, config['acc_metric'])
 
                 val_dataset = to_dataframe(y_true=y_valid, y_pred=valid_pred_scores, y_prot=p_valid,
                                            prot_name=config['protected'])
@@ -354,6 +340,7 @@ def main(config):
                 dataloaders_roc = None
                 dataset_sizes_roc = None
                 ROC = None
+                torch.cuda.empty_cache()
 
         # Evaluate the equality of odds post-processing
         if 'EqOdds' in config['models']:
@@ -379,19 +366,7 @@ def main(config):
                     model=model, device=device, dataloader=dataloaders_eo['test'],
                     dataset_size=dataset_sizes_eo['test'], batch_size=config['default']['batch_size'])
 
-            threshs = np.linspace(0, 1, 101)
-            performances = []
-            for thresh in threshs:
-                if config['acc_metric'] == 'balanced_accuracy':
-                    perf = balanced_accuracy_score(y_valid, valid_pred_scores > thresh)
-                elif config['acc_metric'] == 'accuracy':
-                    perf = accuracy_score(y_valid, valid_pred_scores > thresh)
-                elif config['acc_metric'] == 'f1_score':
-                    perf = f1_score(y_valid, valid_pred_scores > thresh)
-                else:
-                    print('Accuracy metric not defined')
-                performances.append(perf)
-            best_thresh = threshs[np.argmax(performances)]
+            best_thresh = find_best_threshold(valid_pred_scores, y_valid, config['acc_metric'])
 
             val_dataset = to_dataframe(y_true=y_valid, y_pred=valid_pred_scores, y_prot=p_valid,
                                        prot_name=config['protected'])
@@ -423,6 +398,8 @@ def main(config):
             dataloaders_eo = None
             dataset_sizes_eo = None
             eo = None
+            del val_dataset, val_dataset_pred, test_dataset, test_dataset_pred
+            torch.cuda.empty_cache()
 
         # Evaluate adversarial intra-processing
         if 'adversarial' in config['models']:
@@ -541,6 +518,8 @@ def main(config):
             # Get rid of data loaders to free up memory
             dataloaders_adv = None
             dataset_sizes_adv = None
+            del actor, critic, base_model
+            torch.cuda.empty_cache()
 
         # Evaluate adversarial in-processing
         if 'mitigating' in config['models']:
@@ -569,19 +548,8 @@ def main(config):
                     dataset_size=dataset_sizes_mit['test'], batch_size=config['mitigating']['batch_size'])
 
                 logger.info('Finding best threshold for debiased model to minimize objective function')
-                threshs = np.linspace(0, 1, 101)
-                performances = []
-                for thresh in threshs:
-                    if config['acc_metric'] == 'balanced_accuracy':
-                        perf = balanced_accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'accuracy':
-                        perf = accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'f1_score':
-                        perf = f1_score(y_valid, valid_pred_scores > thresh)
-                    else:
-                        print('Accuracy metric not defined')
-                    performances.append(perf)
-                best_thresh = threshs[np.argmax(performances)]
+
+                best_thresh = find_best_threshold(valid_pred_scores, y_valid, config['acc_metric'])
 
                 logger.info('Evaluating debiased model with best threshold.')
                 results_valid['mitigating'] = get_valid_objective_(y_pred=(valid_pred_scores > best_thresh),
@@ -595,6 +563,8 @@ def main(config):
                 # Get rid of data loaders to free up memory
                 dataloaders_mit = None
                 dataset_sizes_mit = None
+                del model_
+                torch.cuda.empty_cache()
 
         # Evaluate bias gradient descent/ascent
         if 'biasGrad' in config['models']:
@@ -626,19 +596,8 @@ def main(config):
                     dataset_size=dataset_sizes_bgda['test'], batch_size=config['biasGrad']['batch_size'])
 
                 logger.info('Finding best threshold for pruned model to minimize objective function')
-                threshs = np.linspace(0, 1, 101)
-                performances = []
-                for thresh in threshs:
-                    if config['acc_metric'] == 'balanced_accuracy':
-                        perf = balanced_accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'accuracy':
-                        perf = accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'f1_score':
-                        perf = f1_score(y_valid, valid_pred_scores > thresh)
-                    else:
-                        print('Accuracy metric not defined')
-                    performances.append(perf)
-                best_thresh = threshs[np.argmax(performances)]
+
+                best_thresh = find_best_threshold(valid_pred_scores, y_valid, config['acc_metric'])
 
             logger.info('Evaluating debiased model with best threshold.')
             results_valid['biasGrad'] = get_valid_objective_(y_pred=(valid_pred_scores > best_thresh), y_val=y_valid,
@@ -651,6 +610,8 @@ def main(config):
             # Get rid of data loaders to free up memory
             dataloaders_bgda = None
             dataset_sizes_bgda = None
+            del model_
+            torch.cuda.empty_cache()
 
         # NOTE: needs to be run the last, makes adjustments to the model object directly (to use less memory)
         # Evaluate pruning
@@ -689,19 +650,7 @@ def main(config):
                     forward_args=[pruned])
 
                 logger.info('Finding best threshold for pruned model to minimize objective function')
-                threshs = np.linspace(0, 1, 101)
-                performances = []
-                for thresh in threshs:
-                    if config['acc_metric'] == 'balanced_accuracy':
-                        perf = balanced_accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'accuracy':
-                        perf = accuracy_score(y_valid, valid_pred_scores > thresh)
-                    elif config['acc_metric'] == 'f1_score':
-                        perf = f1_score(y_valid, valid_pred_scores > thresh)
-                    else:
-                        print('Accuracy metric not defined')
-                    performances.append(perf)
-                best_thresh = threshs[np.argmax(performances)]
+                best_thresh = find_best_threshold(valid_pred_scores, y_valid, config['acc_metric'])
 
             logger.info('Evaluating debiased model with best threshold.')
             results_valid['pruning'] = get_valid_objective_(y_pred=(valid_pred_scores > best_thresh), y_val=y_valid,
@@ -714,6 +663,8 @@ def main(config):
             # Get rid of data loaders to free up memory
             dataloaders_pruning = None
             dataset_sizes_pruning = None
+            del model_pruned, pruned
+            torch.cuda.empty_cache()
 
         # Save the results
         results_valid['config'] = config
@@ -727,41 +678,10 @@ def main(config):
         logger.info(f'Saving validation results to {config["experiment_name"]}_test_output_{seed}.json')
         with open(Path('results') / 'logs' / f'{config["experiment_name"]}_test_output_{seed}.json', 'w') as fh:
             json.dump(results_test, fh)
-
-
-def load_config(config_path='../configs/preprocessing.yml'):
-    # Guard check - Config Exists
-    config_path = Path(config_path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Configuration file not found at: {config_path.resolve()}")
-
-    try:
-        with open(config_path, 'r') as f:
-            full_cfg = yaml.safe_load(f)
-
-        cfg = full_cfg['MIMIC']
-
-        root_dir = Path(cfg['root_dir']).resolve()
-        data_dir = root_dir / cfg['data_subdir']
-        res_dir = root_dir / cfg['output_subdir']
-
-        root_files = cfg['root_files']
-        patients_csv = root_dir / root_files['patients']
-        admissions_csv = root_dir / root_files['admissions']
-        chexpert_csv = root_dir / root_files['chexpert']
-        metadata_csv = root_dir / root_files['metadata']
-
-        return {
-            'root_dir': root_dir,
-            'data_dir': data_dir,
-            'out_dir': res_dir,
-            'patients_csv': patients_csv,
-            'admissions_csv': admissions_csv,
-            'chexpert_csv': chexpert_csv,
-            'metadata_csv': metadata_csv
-        }
-    except Exception as e:
-        raise Exception(f"Error loading preprocessing configuration {e} for config {config_path.resolve()}")
+        
+        # Drop GPU-backed objects
+        del model, dataloaders
+        torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':
