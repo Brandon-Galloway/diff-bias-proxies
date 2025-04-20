@@ -16,13 +16,14 @@ from utils.evaluation import compute_empirical_bias, compute_accuracy_metrics
 from torch import nn
 
 from torchvision import models
+from torchvision.models import VGG16_Weights, ResNet18_Weights
 
 
 class ChestXRayResNet18(nn.Module):
     """ResNet-18"""
     def __init__(self, pretrained=True):
         super().__init__()
-        self.resnet18 = models.resnet18(pretrained=pretrained)
+        self.resnet18 = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self.out = nn.Linear(1000, 1)
 
     def forward(self, t):
@@ -38,7 +39,7 @@ class ChestXRayVGG16(nn.Module):
     """VGG-16"""
     def __init__(self, pretrained=True):
         super().__init__()
-        self.vgg16 = models.vgg16(pretrained=pretrained)
+        self.vgg16 = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
         self.out = nn.Linear(1000, 1)
 
     def forward(self, t):

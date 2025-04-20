@@ -12,6 +12,8 @@ import pandas as pd
 
 from PIL import Image
 
+from pathlib import Path
+
 from torch.utils.data import DataLoader, Dataset
 
 from torchvision import transforms
@@ -39,7 +41,7 @@ class ChestXRay_mimic_DatasetGenerator(Dataset):
             imageLabel = label_list.iloc[i]
             imageAttr = attribute_list[i]
 
-            if imageLabel[0] != 1:
+            if imageLabel.iloc[0] != 1:
                 imgLabel = 0
                 imgLabel_cnt = imgLabel_cnt + [0, 1]
             else:
@@ -73,9 +75,11 @@ def train_test_split_ChestXray_mimic(root_dir, prot_attr='gender', priv_class='M
                                      train_prot_ratio=0.75, seed=42,
                                      class_names=['Enlarged Cardiomediastinum', 'No Finding']):
     """Performs train-validation-test split for the MIMIC-CXR dataset"""
-    img_mat = np.load(root_dir + 'files_128.npy')
+    
+    df = pd.read_csv(root_dir / 'meta_data.csv')
+    N = len(df)
+    img_mat = np.memmap(root_dir / 'files_128.npy', dtype='uint8', mode='r', shape=(N, 128, 128))
 
-    df = pd.read_csv(root_dir + 'meta_data.csv')
     cnt_dis = len(df[df[class_names[0]] == 1])
     df = pd.concat([df[df[class_names[0]] == 1], df[df[class_names[1]] == 1].sample(n=int(cnt_dis))])
     print('Number of images total: ', len(df))

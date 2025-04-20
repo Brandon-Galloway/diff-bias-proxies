@@ -57,7 +57,7 @@ def main(config):
 
     # NOTE: replace with relevant directories
     if config['dataset'] == 'chestxray_mimic':
-        ROOT_DIR = '...'
+        ROOT_DIR = Path(config['root_dir'])
     else:
         NotImplementedError('This chest X-ray dataset not supported!')
 
@@ -97,7 +97,7 @@ def main(config):
         model_path = os.path.join('models', config['modelpath'] + str('_') + str(seed) + '.pt')
         if Path(model_path).is_file():
             logger.info(f'Loading Model from {model_path}.')
-            model.load_state_dict(torch.load(model_path))
+            model.load_state_dict(torch.load(model_path, weights_only=True))
         else:
             logger.info(f'Training model from scratch.')
 
@@ -729,10 +729,58 @@ def main(config):
             json.dump(results_test, fh)
 
 
+def load_config(config_path='../configs/preprocessing.yml'):
+    # Guard check - Config Exists
+    config_path = Path(config_path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Configuration file not found at: {config_path.resolve()}")
+
+    try:
+        with open(config_path, 'r') as f:
+            full_cfg = yaml.safe_load(f)
+
+        cfg = full_cfg['MIMIC']
+
+        root_dir = Path(cfg['root_dir']).resolve()
+        data_dir = root_dir / cfg['data_subdir']
+        res_dir = root_dir / cfg['output_subdir']
+
+        root_files = cfg['root_files']
+        patients_csv = root_dir / root_files['patients']
+        admissions_csv = root_dir / root_files['admissions']
+        chexpert_csv = root_dir / root_files['chexpert']
+        metadata_csv = root_dir / root_files['metadata']
+
+        return {
+            'root_dir': root_dir,
+            'data_dir': data_dir,
+            'out_dir': res_dir,
+            'patients_csv': patients_csv,
+            'admissions_csv': admissions_csv,
+            'chexpert_csv': chexpert_csv,
+            'metadata_csv': metadata_csv
+        }
+    except Exception as e:
+        raise Exception(f"Error loading preprocessing configuration {e} for config {config_path.resolve()}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', help='Path to configuration yaml file.')
     args = parser.parse_args()
     with open(args.config, 'r') as fh:
         config = yaml.load(fh, Loader=yaml.FullLoader)
+
+    # Load the preprocessing config and extract the root_dir
+    with open('./configs/preprocessing.yml', 'r') as fh:
+        preprocessing_cfg = yaml.load(fh, Loader=yaml.FullLoader)
+    
+    # Inject preprocessing root_dir
+    mimic_cfg = preprocessing_cfg.get('MIMIC', {})
+    mimic_root = mimic_cfg.get('root_dir')
+    output_subdir = mimic_cfg.get('output_subdir')
+    if not mimic_root or not output_subdir:
+        raise ValueError("Missing 'root_dir' or 'output_subdir' in MIMIC section of preprocessing config.")
+    config['root_dir'] = str(Path(mimic_root) / output_subdir)
+
     main(config)
