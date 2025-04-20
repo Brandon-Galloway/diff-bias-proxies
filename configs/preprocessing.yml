@@ -1,0 +1,29 @@
+# Expected Folder Structure:
+# root_dir/
+# ├── patients.csv
+# ├── admissions.csv
+# ├── mimic-cxr-2.0.0-chexpert.csv
+# ├── mimic-cxr-2.0.0-metadata.csv
+# ├── data_subdir/
+# │   └── files/
+# │       └── p##/
+# │           └── p#######/
+# │               └── s#######/
+# │                   └── #########.jpg
+# └── output_subdir/
+MIMIC:
+  # MIMIC
+  root_dir: /mnt/c/Users/Brandon/Desktop/Final Project/MIMIC-CXR
+  data_subdir: mimic-cxr-jpg-2.0.0.physionet.org
+  output_subdir: mimic-cxr-jpg-processed
+
+  # Expected files under root_dir
+  root_files:
+    # MIMIC-IV v3.1 patients.csv
+    patients: patients.csv
+    # MIMIC-IV v3.1 admissions.csv
+    admissions: admissions.csv
+    # MIMIC-III chexpert.csv
+    chexpert: mimic-cxr-2.0.0-chexpert.csv
+    # MIMIC-III metadata.csv
+    metadata: mimic-cxr-2.0.0-metadata.csv
