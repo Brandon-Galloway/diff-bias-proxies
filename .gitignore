@@ -142,9 +142,10 @@ bin/*.tiff
 
 .Rhistory
 
-bin/results
-bin/models
-bin/results/figures
+**/results
+**/models
+!**/models/**/*.py
+**/results/figures
 
 bin/tmp/*
 /data/
