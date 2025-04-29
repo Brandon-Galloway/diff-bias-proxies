@@ -6,8 +6,21 @@ import numpy as np
 import torch
 
 from sklearn.metrics import (average_precision_score, balanced_accuracy_score)
+from sklearn.metrics import balanced_accuracy_score, accuracy_score, f1_score
 from sklearn.metrics import roc_auc_score, f1_score
 
+def find_best_threshold(scores, labels, metric):
+    threshs = np.linspace(0, 1, 101)
+    if metric == 'balanced_accuracy':
+        scorer = balanced_accuracy_score
+    elif metric == 'accuracy':
+        scorer = accuracy_score
+    elif metric == 'f1_score':
+        scorer = f1_score
+    else:
+        raise ValueError(metric)
+    perf = [scorer(labels, scores > t) for t in threshs]
+    return threshs[int(np.argmax(perf))]
 
 def compute_empirical_bias(y_pred, y_true, priv, metric):
     """Evaluates the model's bias empirically on the given data, used by the adversarial intra-processing algorithm"""

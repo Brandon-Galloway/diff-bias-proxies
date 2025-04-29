@@ -1,0 +1,28 @@
+version: "2.2"
+tables:
+  patients:
+    file_path: "hosp/patients.csv.gz"
+    patient_id: "subject_id"
+    timestamp: null
+    attributes:
+      - "gender"
+      - "anchor_age"
+      - "anchor_year"
+      - "anchor_year_group"
+      - "dod"
+
+  admissions:
+    file_path: "hosp/admissions.csv.gz"
+    patient_id: "subject_id"
+    timestamp: "admittime"
+    attributes:
+      - "hadm_id"
+      - "admission_type"
+      - "admission_location"
+      - "insurance"
+      - "language"
+      - "marital_status"
+      - "race"
+      - "discharge_location"
+      - "dischtime"
+      - "hospital_expire_flag"

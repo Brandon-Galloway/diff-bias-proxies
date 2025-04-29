@@ -14,7 +14,7 @@ from PIL import Image
 
 from pathlib import Path
 
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 
 from torchvision import transforms
 
@@ -75,7 +75,6 @@ def train_test_split_ChestXray_mimic(root_dir, prot_attr='gender', priv_class='M
                                      train_prot_ratio=0.75, seed=42,
                                      class_names=['Enlarged Cardiomediastinum', 'No Finding']):
     """Performs train-validation-test split for the MIMIC-CXR dataset"""
-    
     df = pd.read_csv(root_dir / 'meta_data.csv')
     N = len(df)
     img_mat = np.memmap(root_dir / 'files_128.npy', dtype='uint8', mode='r', shape=(N, 128, 128))

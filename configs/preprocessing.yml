@@ -13,8 +13,9 @@
 # └── output_subdir/
 MIMIC:
   # MIMIC
-  root_dir: /mnt/c/Users/Brandon/Desktop/Final Project/MIMIC-CXR
-  data_subdir: mimic-cxr-jpg-2.0.0.physionet.org
+  root_dir: /mnt/c/Users/Brandon/Desktop/Final Project
+  mimic_subdir: MIMIC-IV/mimiciv-0.4.physionet.org
+  cxr_subdir: MIMIC-CXR/mimic-cxr-jpg-2.0.0.physionet.org
   output_subdir: mimic-cxr-jpg-processed
 
   # Expected files under root_dir

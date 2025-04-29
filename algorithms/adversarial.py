@@ -3,18 +3,178 @@ Adversarial intra-processing algorithm by Savani et al. (2020) [https://arxiv.or
 
 Code adapted from https://github.com/abacusai/intraprocessing_debiasing
 """
-import logging
+import copy
 
 import math
 
 import numpy as np
+
 import torch
+from torch import optim, nn
 import torch.optim as optim
+from torch.amp import autocast, GradScaler
+from tqdm import tqdm
 
-from models.networks_tabular import load_model, Critic
-from utils.evaluation import get_best_thresh, get_test_objective, get_valid_objective, compute_empirical_bias
+from models.networks_tabular import load_model, Critic as TabularCritic
+from utils.evaluation import (
+    eval_model_w_data_loaders,
+    get_valid_objective_,
+    get_test_objective,
+    get_valid_objective,
+    get_test_objective_,
+    compute_empirical_bias,
+    get_best_thresh
+)
+from models.networks_ChestXRay import Critic as CXR_Critic
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger("Debiasing")
+logger = get_logger("Adversarial Model Debiasing")
+
+def evaluate_adversarial_model(model, dataloaders, dataset_sizes, config, device):
+    """
+    Perform adversarial in-processing evaluation.
+    Trains critic and actor iteratively, finds best threshold, then evaluates on validation and test sets.
+    Returns dicts keyed by 'adversarial' for validation and test results.
+    """
+    # Prepare adversarial components
+    batch_size = config['adversarial']['batch_size']
+    # Base feature extractor from model (assumes vgg16 attr)
+    base_model = copy.deepcopy(model.vgg16)
+    base_model.classifier[-1] = nn.Linear(
+        base_model.classifier[-1].in_features,
+        base_model.classifier[-1].in_features
+    )
+    actor = nn.Sequential(
+        base_model,
+        nn.Linear(base_model.classifier[-1].in_features, 2)
+    ).to(device)
+    actor_optimizer = optim.Adam(actor.parameters(), lr=config['adversarial']['lr'])
+    actor_loss_fn = nn.BCEWithLogitsLoss()
+
+    critic = CXR_Critic(
+        config['adversarial']['batch_size'] * base_model.classifier[-1].in_features
+    ).to(device)
+    critic_optimizer = optim.Adam(critic.parameters(), lr=config['adversarial'].get('critic_lr', 1e-4))
+    critic_loss_fn = nn.MSELoss()
+
+    actor_steps = config['adversarial']['actor_steps']
+    critic_steps = config['adversarial']['critic_steps']
+    epochs = config['adversarial']['epochs']
+
+    scaler_actor = GradScaler()
+    scaler_critic = GradScaler()
+
+    # Iterative training
+    logger.info("Starting adversarial training for %d epochs.", epochs)
+    for epoch in range(epochs):
+        logger.info("Epoch %d/%d", epoch + 1, epochs)
+        # Train critic
+        critic.train()
+        actor.eval()
+        critic_bar = tqdm(enumerate(dataloaders['val']), total=critic_steps, desc=f"Critic Epoch {epoch+1}", leave=False)
+        for step, (X, y, p) in critic_bar:
+            
+            if step >= critic_steps:
+                break
+            X, y, p = X.to(device), y.to(device), p.to(device)
+            
+            if X.size(0) != batch_size:
+                continue
+            critic_optimizer.zero_grad()
+            
+            with torch.no_grad(), autocast(device_type=device.type):
+                y_pred = actor(X)
+            
+            bias = compute_empirical_bias(y_pred, y.float(), p.float(), config['metric'])
+            
+            with autocast(device_type=device.type):
+                res = critic(base_model(X))
+                loss = critic_loss_fn(bias.unsqueeze(0), res[0])
+            
+            scaler_critic.scale(loss).backward()
+            scaler_critic.step(critic_optimizer)
+            scaler_critic.update()
+            critic_bar.set_postfix(loss=loss.item())
+
+        # Train actor
+        critic.eval()
+        actor.train()
+        actor_bar = tqdm(enumerate(dataloaders['val']), total=actor_steps, desc=f"Actor Epoch {epoch+1}", leave=False)
+        for step, (X, y, p) in actor_bar:
+            if step >= actor_steps:
+                break
+            X, y, p = X.to(device), y.to(device), p.to(device)
+            if X.size(0) != batch_size:
+                continue
+            actor_optimizer.zero_grad()
+            with autocast(device_type=device.type):
+                est_bias = critic(base_model(X))
+                loss = actor_loss_fn(actor(X)[:, 0], y.float())
+                # scale loss by bias constraint
+                margin = config['adversarial']['margin']
+                epsilon = config['objective']['epsilon']
+                scaled = max(1, config['adversarial']['lambda'] * (abs(est_bias) - epsilon + margin) + 1)
+                loss = loss * scaled
+            scaler_actor.scale(loss).backward()
+            scaler_actor.step(actor_optimizer)
+            scaler_actor.update()
+            actor_bar.set_postfix(loss=loss.item())
+
+    # Determine threshold via validation
+    logger.info("Training completed. Determining best threshold.")
+    _, best_thresh = val_model_dataloaders(
+        actor, dataloaders['val'], get_best_objective, device, config
+    )
+    best_thresh = best_thresh.cpu().numpy()
+    logger.info("Determined adversarial best threshold: %.4f", best_thresh)
+
+    # Evaluate final actor
+    logger.info("Starting final evaluation.")
+    actor.eval()
+    with torch.no_grad(), autocast(device_type=device.type):
+        valid_scores, y_valid, p_valid = eval_model_w_data_loaders(
+            model=actor,
+            device=device,
+            dataloader=dataloaders['val'],
+            dataset_size=dataset_sizes['val'],
+            batch_size=batch_size
+        )
+    
+    with torch.no_grad(), autocast(device_type=device.type):
+        test_scores, y_test, p_test = eval_model_w_data_loaders(
+            model=actor,
+            device=device,
+            dataloader=dataloaders['test'],
+            dataset_size=dataset_sizes['test'],
+            batch_size=batch_size
+        )
+
+    results_valid = {
+        'adversarial': get_valid_objective_(
+            y_pred=(valid_scores > best_thresh),
+            y_val=y_valid,
+            p_val=p_valid,
+            config=config
+        )
+    }
+    results_test = {
+        'adversarial': get_test_objective_(
+            y_pred=(test_scores > best_thresh),
+            y_test=y_test,
+            p_test=p_test,
+            config=config
+        )
+    }
+    logger.info("Adversarial validation results: %s", results_valid['adversarial'])
+    logger.info("Adversarial test results: %s", results_test['adversarial'])
+
+    # Cleanup
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    logger.info("GPU cache cleared.")
+
+    return results_valid, results_test
+
 
 
 def val_model_dataloaders(model, loader, criterion, device, config):
@@ -71,7 +231,7 @@ def adversarial_debiasing(model_state_dict, data, config, device):
     actor.load_state_dict(model_state_dict)
     actor.to(device)
     hid = config['hyperparameters']['hid'] if 'hyperparameters' in config else 32
-    critic = Critic(hid * config['adversarial']['batch_size'], num_deep=config['adversarial']['num_deep'], hid=hid)
+    critic = TabularCritic(hid * config['adversarial']['batch_size'], num_deep=config['adversarial']['num_deep'], hid=hid)
     critic.to(device)
     critic_optimizer = optim.Adam(critic.parameters())
     critic_loss_fn = torch.nn.MSELoss()

@@ -9,17 +9,99 @@ import matplotlib.pyplot as plt
 
 import copy
 
+from tqdm import tqdm
+
 import torch
 from torch import nn
 from torch import optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast
 
 from sklearn.metrics import balanced_accuracy_score
 
 import utils.data_utils
-from utils.evaluation import (get_objective, get_test_objective_)
+from utils.evaluation import (
+    eval_model_w_data_loaders,
+    find_best_threshold,
+    get_valid_objective_,
+    get_test_objective_,
+    get_objective
+)
 
-import progressbar
+from utils.logging_utils import get_logger
+
+logger = get_logger("BiasGrad Model Debiasing")
+
+def evaluate_biasgrad_model(model, dataloaders, dataset_sizes, config, device):
+    """
+    Perform bias gradient descent/ascent mitigation on the model.
+    Returns dicts keyed by 'biasGrad' for validation and test results.
+    """
+    batch_size = config['biasGrad']['batch_size']
+    logger.info("Starting bias gradient descent/ascent mitigation.")
+
+    # Train a mitigated model via bias_gda_dataloaders
+    mitigated_model = bias_gda_dataloaders(
+        model=model,
+        data_loader_train=dataloaders['val'],
+        data_loader_val=dataloaders['val'],
+        dataset_size_val=dataset_sizes['val'],
+        opt_alg=optim.Adam,
+        device=device,
+        config=config,
+        seed=config.get('seed', None),
+        plot=False,
+        display=False
+    )
+    logger.info("Bias mitigation completed. Evaluating model.")
+    mitigated_model.to(device)
+    mitigated_model.eval()
+
+    # Collect scores
+    with torch.no_grad():
+        valid_scores, y_valid, p_valid = eval_model_w_data_loaders(
+            model=mitigated_model,
+            device=device,
+            dataloader=dataloaders['val'],
+            dataset_size=dataset_sizes['val'],
+            batch_size=batch_size
+        )
+        logger.info("Validation evaluation completed.")
+        test_scores, y_test, p_test = eval_model_w_data_loaders(
+            model=mitigated_model,
+            device=device,
+            dataloader=dataloaders['test'],
+            dataset_size=dataset_sizes['test'],
+            batch_size=batch_size
+        )
+        logger.info("Test evaluation completed.")
+
+    # Determine best threshold
+    best_thresh = find_best_threshold(valid_scores, y_valid, config['acc_metric'])
+    logger.info(f"Determined biasGrad best threshold: {best_thresh:.4f}")
+
+    # Compute objectives
+    valid_obj = get_valid_objective_(
+        y_pred=(valid_scores > best_thresh),
+        y_val=y_valid,
+        p_val=p_valid,
+        config=config
+    )
+    logger.info("Validation results (biasGrad): %s", valid_obj)
+
+    test_obj = get_test_objective_(
+        y_pred=(test_scores > best_thresh),
+        y_test=y_test,
+        p_test=p_test,
+        config=config
+    )
+    logger.info(f"Test results (biasGrad): {test_obj}")
+
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        logger.info("GPU cache cleared.")
+
+    return {'biasGrad': valid_obj}, {'biasGrad': test_obj}
 
 
 def spd_diff(y_pred, y_true, p):
@@ -91,16 +173,14 @@ def save_finetuning_trajectory(results: dict, seed: int, config: dict):
         print('WARNING: log directory is missing!')
 
 
-def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: bool = False, plot: bool = False,
-                         display: bool = False, verbose: int = 1):
+def bias_gradient_decent(model: nn.Module, data, config: dict, device, seed: int, asc: bool = False, plot: bool = False,
+                         display: bool = False):
     """Runs bias GD/A for the given model on the tabular data"""
     # Suppress warnings
     import warnings
     warnings.filterwarnings("ignore", category=UserWarning)
 
-    if verbose:
-        print('Performing bias gradient ascent/descent...')
-        print()
+    logger.info('Performing bias gradient ascent/descent...\n')
 
     model_ = copy.deepcopy(model)
 
@@ -122,11 +202,9 @@ def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: b
         raise NotImplementedError('ERROR: bias metric not supported!')
 
     optimiser = optim.Adam(model_.parameters(), lr=config['biasGrad']['lr'])
+    logger.info(f'Using Adam optimizer with lr: {config["biasGrad"]["lr"]}')
 
-    if verbose:
-        bar = progressbar.ProgressBar(maxval=config['biasGrad']['n_epochs'])
-        bar.start()
-        bar_cnt = 0
+    epoch_bar = tqdm(total=config['biasGrad']['n_epochs'], desc='Epochs')
 
     for i in range(config['biasGrad']['n_epochs']):
         if config['biasGrad']['val_only']:
@@ -138,7 +216,9 @@ def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: b
         eval_factor = int(len(batch_idxs) / config['biasGrad']['n_evals'])
         batch_cnt = 0
 
-        for batch in batch_idxs:
+        batch_bar = tqdm(batch_idxs, desc=f'Epoch {i+1} Batches', leave=False)
+
+        for batch in batch_bar:
             if config['biasGrad']['val_only']:
                 X = data.X_valid[batch, :]
                 y = data.y_valid[batch]
@@ -149,16 +229,19 @@ def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: b
                 p = data.p_train[batch]
 
             optimiser.zero_grad()
-            loss = loss_fn(y_pred=model_(X)[:, 0], y_true=y, p=p)
-            if asc:
-                loss = -loss
+            with autocast('cuda',enabled=(device.type == 'cuda')):
+                loss = loss_fn(y_pred=model_(X)[:, 0], y_true=y, p=p)
+                if asc:
+                    loss = -loss
             loss.backward()
             train_loss += loss.item()
             optimiser.step()
 
-            if batch_cnt % eval_factor == 0:        # Evaluate fine-tuned model on the validation set
+            # Evaluate fine-tuned model on the validation set
+            if batch_cnt % eval_factor == 0:
                 with torch.no_grad():
-                    valid_pred_scores = model_(data.X_valid)[:, 0].reshape(-1, 1).cpu().numpy()
+                    with autocast('cuda',enabled=(device.type == 'cuda')):
+                        valid_pred_scores = model_(data.X_valid)[:, 0].reshape(-1, 1).cpu().numpy()
 
                     # Choose the best threshold w.r.t. the balanced accuracy on the held-out data
                     best_thresh = choose_best_thresh_bal_acc(data=data, valid_pred_scores=valid_pred_scores)
@@ -178,14 +261,10 @@ def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: b
 
             batch_cnt += 1
 
-        if verbose:
-            bar.update(bar_cnt)
-            bar_cnt += 1
-
-    if verbose:
-        print('\n' * 2)
+        epoch_bar.update(1)
 
     # Save performance traces
+    logger.info('Training complete. Saving fine-tuning trajectory...\n')
     save_finetuning_trajectory(
         results={'objective': pred_performance_ * (np.abs(bias_metric_) < config['objective']['epsilon']),
                  'bias': bias_metric_,
@@ -194,6 +273,7 @@ def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: b
 
     # Plot performance traces
     if plot:
+        logger.info('Plotting performance traces...')
         step_num = np.arange(1, len(objective_) + 1)
         plot_results(step_num=step_num, objective=objective_,
                      bias_metric=bias_metric_, pred_performance=pred_performance_, j_best=j_best,
@@ -202,8 +282,7 @@ def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: b
     model_.eval()
 
     if best_model is None:
-        print('\n' * 2)
-        print('No debiased model satisfies the constraints!')
+        logger.info('No debiased model satisfies the constraints!')
         best_model = copy.deepcopy(model)
 
     best_model.eval()
@@ -213,7 +292,7 @@ def bias_gradient_decent(model: nn.Module, data, config: dict, seed: int, asc: b
 
 def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_loader_val: DataLoader, dataset_size_val,
                          opt_alg, device, config: dict, seed: int, plot: bool = False,
-                         display: bool = False, verbose: int = 1):
+                         display: bool = False):
     """Runs bias GD/A for the given model with the provided data loaders"""
     # NOTE: set data_loader_train to None in the call if you want to perform debiasing on the validation set only
 
@@ -221,9 +300,7 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
     import warnings
     warnings.filterwarnings("ignore", category=UserWarning)
 
-    if verbose:
-        print('Performing bias gradient ascent/descent...')
-        print()
+    logger.info('Starting bias gradient ascent/descent with dataloaders...')
 
     model_ = copy.deepcopy(model)
 
@@ -249,35 +326,32 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
     # If training data are not provided, perform the procedure entirely on the validation data
     if data_loader_train is None:
         data_loader_train = data_loader_val
-
-    if verbose:
-        bar = progressbar.ProgressBar(maxval=config['biasGrad']['n_epochs'])
-        bar.start()
-        bar_cnt = 0
+        logger.info('Training loader not provided, using validation loader for training.')
 
     # Evaluate the original model (in case it is already unbiased)
+    logger.info('Evaluating original model...')
     with torch.no_grad():
         valid_pred_scores = np.zeros((dataset_size_val,))
         y_valid = np.zeros((dataset_size_val,))
         p_valid = np.zeros((dataset_size_val,))
 
-        with torch.no_grad():
-            cnt = 0
-            for X_, y_, p_ in data_loader_val:
-                X_ = X_.to(device)
-                y_ = y_.to(device).to(torch.float)
-                p_ = p_.to(device)
+        cnt = 0
+        for X_, y_, p_ in tqdm(data_loader_val, desc='Validation Evaluation', leave=False):
+            X_ = X_.to(device)
+            y_ = y_.to(device).to(torch.float)
+            p_ = p_.to(device)
 
+            with autocast('cuda', enabled=(device.type == 'cuda')):
                 outputs = model_(X_)
 
-                valid_pred_scores[cnt * config['biasGrad']['batch_size']:(cnt + 1) * config['biasGrad'][
-                    'batch_size']] = outputs[:, 0].cpu().numpy()
-                y_valid[cnt * config['biasGrad']['batch_size']:(cnt + 1) * config['biasGrad'][
-                    'batch_size']] = y_.cpu().numpy()
-                p_valid[cnt * config['biasGrad']['batch_size']:(cnt + 1) * config['biasGrad'][
-                    'batch_size']] = p_.cpu().numpy()
+            start_idx = cnt * config['biasGrad']['batch_size']
+            end_idx = (cnt + 1) * config['biasGrad']['batch_size']
 
-                cnt += 1
+            valid_pred_scores[start_idx:end_idx] = outputs[:, 0].detach().cpu().numpy()
+            y_valid[start_idx:end_idx] = y_.detach().cpu().numpy()
+            p_valid[start_idx:end_idx] = p_.detach().cpu().numpy()
+
+            cnt += 1
 
         # Choose the best threshold w.r.t. the balanced accuracy on the held-out data
         best_thresh = choose_best_thresh_bal_acc_(y_valid=y_valid, valid_pred_scores=valid_pred_scores)
@@ -297,24 +371,24 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
 
     # Actual debiasing
     terminus_est = False
+    epoch_bar = tqdm(total=config['biasGrad']['n_epochs'], desc='Epochs')
     for i in range(config['biasGrad']['n_epochs']):
-
+        logger.info(f'Starting epoch {i+1}')
         eval_factor = int(len(data_loader_train) / config['biasGrad']['n_evals'])
         batch_cnt = 0
 
         # Iterate over data
-        for X, y, p in data_loader_train:
-
+        batch_bar = tqdm(data_loader_train, desc=f'Epoch {i+1} Batches', leave=False)
+        for X, y, p in batch_bar:
             X = X.to(device)
             y = y.to(device).to(torch.float)
             p = p.to(device)
 
             optimiser.zero_grad()
-
-            loss = loss_fn(y_pred=model_(X)[:, 0], y_true=y, p=p)
-
-            if asc:
-                loss = -loss
+            with autocast('cuda', enabled=(device.type == 'cuda')):
+                loss = loss_fn(y_pred=model_(X)[:, 0], y_true=y, p=p)
+                if asc:
+                    loss = -loss
             loss.backward()
             optimiser.step()
 
@@ -325,23 +399,23 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
                     y_valid = np.zeros((dataset_size_val,))
                     p_valid = np.zeros((dataset_size_val,))
 
-                    with torch.no_grad():
-                        cnt = 0
-                        for X_, y_, p_ in data_loader_val:
-                            X_ = X_.to(device)
-                            y_ = y_.to(device).to(torch.float)
-                            p_ = p_.to(device)
+                    cnt = 0
+                    for X_, y_, p_ in tqdm(data_loader_val, desc='Validation Eval', leave=False):
+                        X_ = X_.to(device)
+                        y_ = y_.to(device).to(torch.float)
+                        p_ = p_.to(device)
 
+                        with autocast('cuda', enabled=(device.type == 'cuda')):
                             outputs = model_(X_)
 
-                            valid_pred_scores[cnt * config['biasGrad']['batch_size']:(cnt + 1) * config['biasGrad'][
-                                'batch_size']] = outputs[:, 0].cpu().numpy()
-                            y_valid[cnt * config['biasGrad']['batch_size']:(cnt + 1) * config['biasGrad'][
-                                'batch_size']] = y_.cpu().numpy()
-                            p_valid[cnt * config['biasGrad']['batch_size']:(cnt + 1) * config['biasGrad'][
-                                'batch_size']] = p_.cpu().numpy()
+                        start_idx = cnt * config['biasGrad']['batch_size']
+                        end_idx = (cnt + 1) * config['biasGrad']['batch_size']
 
-                            cnt += 1
+                        valid_pred_scores[start_idx:end_idx] = outputs[:, 0].detach().cpu().numpy()
+                        y_valid[start_idx:end_idx] = y_.detach().cpu().numpy()
+                        p_valid[start_idx:end_idx] = p_.detach().cpu().numpy()
+
+                        cnt += 1
 
                     # Choose the best threshold w.r.t. the balanced accuracy on the held-out data
                     best_thresh = choose_best_thresh_bal_acc_(y_valid=y_valid, valid_pred_scores=valid_pred_scores)
@@ -370,14 +444,13 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
             batch_cnt += 1
 
         if terminus_est:
+            logger.info('Early termination due to low performance.')
             break
 
-        if verbose:
-            bar.update(bar_cnt)
-            bar_cnt += 1
+        epoch_bar.update(1)
 
-        if verbose:
-            print('\n' * 2)
+    epoch_bar.close()
+    logger.info('Training finished. Saving performance traces...')
 
     # Save performance traces
     save_finetuning_trajectory(
@@ -388,18 +461,18 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
 
     # Plot performance traces
     if plot:
+        logger.info('Plotting training curves...')
         step_num = np.arange(1, len(objective_) + 1)
         plot_results(step_num=step_num, objective=objective_,
                      bias_metric=bias_metric_, pred_performance=pred_performance_, j_best=j_best,
                      seed=seed, config=config, display=display, suffix='')
 
     if best_model is None:
-        print()
-        print()
-        print('No debiased model satisfies the constraints!')
+        logger.info('No debiased model satisfies the constraints. Returning initial model.')
         best_model = copy.deepcopy(model)
 
     model_.eval()
     best_model.eval()
+    logger.info('Returning best model.')
 
     return best_model
