@@ -22,6 +22,10 @@ from utils.misc_utils import set_seeds
 
 from sklearn.model_selection import train_test_split
 
+import joblib
+
+import hashlib
+
 
 class ChestXRay_mimic_DatasetGenerator(Dataset):
     """Chest X-ray Dataset object"""
@@ -75,6 +79,18 @@ def train_test_split_ChestXray_mimic(root_dir, prot_attr='gender', priv_class='M
                                      train_prot_ratio=0.75, seed=42,
                                      class_names=['Enlarged Cardiomediastinum', 'No Finding']):
     """Performs train-validation-test split for the MIMIC-CXR dataset"""
+    cache_dir = Path('results/cache')
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_key_raw = f"{Path(root_dir).resolve()}_{prot_attr}_{priv_class}_{unpriv_class}_{train_prot_ratio}_{seed}_{'_'.join(class_names)}"
+    cache_key = hashlib.md5(cache_key_raw.encode()).hexdigest()
+    cache_path = cache_dir / f"split_cache_{cache_key}.pkl"
+
+    if cache_path.exists():
+        print(f"Loading cached data split from: {cache_path}")
+        return joblib.load(cache_path)
+    
+    
     df = pd.read_csv(root_dir / 'meta_data.csv')
     N = len(df)
     img_mat = np.memmap(root_dir / 'files_128.npy', dtype='uint8', mode='r', shape=(N, 128, 128))
@@ -142,8 +158,15 @@ def train_test_split_ChestXray_mimic(root_dir, prot_attr='gender', priv_class='M
     test_imgs = img_mat[test_list, :, :]
     print('Number of priveleged images in test set: ', sum(test_attr))
 
-    return train_list, val_list, test_list, train_label, val_label, test_label, train_attr, val_attr, test_attr, \
-           train_imgs, val_imgs, test_imgs
+    data = (
+            train_list, val_list, test_list,
+            train_label, val_label, test_label,
+            train_attr, val_attr, test_attr,
+            train_imgs, val_imgs, test_imgs
+        )
+    joblib.dump(data, cache_path)
+    print(f"Saved data split cache to: {cache_path}")
+    return data
 
 
 def get_ChestXRay_mimic_dataloaders(device, root_dir, prot_attr='gender', priv_class='M', unpriv_class='F',
