@@ -176,8 +176,8 @@ def eval_model_w_data_loaders(model, device, dataloader, dataset_size: int, batc
             labels = labels.to(device).to(torch.float)
             attrs = attrs.to(device)
 
-            if forward_args is not None:
-                outputs = model(inputs, *forward_args)
+            if forward_args and forward_args[0] is not None:
+                outputs = model(inputs, pruned=forward_args[0])
             else:
                 outputs = model(inputs)
 

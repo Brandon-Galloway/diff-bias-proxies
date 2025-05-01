@@ -734,6 +734,9 @@ def prune(model, layer_map, data_loader_train, data_loader_val, dataset_size_val
             seed=seed, config=config)
 
         # List of units to be pruned
+        if to_prune_best is None:
+            logger.warning('No valid pruned model found; returning original model and empty mask.')
+            to_prune_best = np.array([], dtype=int)
         to_prune = np.array(to_prune_best)
 
         model.eval()

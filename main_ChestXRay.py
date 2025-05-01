@@ -20,6 +20,8 @@ from algorithms.adversarial import (evaluate_adversarial_model)
 from algorithms.mitigating import evaluate_mitigating_model
 from algorithms.pruning import evaluate_pruning_model
 from algorithms.biasGrad import evaluate_biasgrad_model
+from algorithms.adaptivePruning import evaluate_adaptive_pruning_model
+
 
 from datasets.chestxray_dataset import get_ChestXRay_mimic_dataloaders
 
@@ -77,7 +79,7 @@ def main(config):
 
     # Set up dataloader cache in advance
     batch_sizes = {config['default']['batch_size']}
-    for key in ['adversarial','mitigating','biasGrad','pruning']:
+    for key in ['adversarial','mitigating','biasGrad','pruning', 'adaptive_pruning']:
         if key in config['models']:
             batch_sizes.add(config[key]['batch_size'])
 
@@ -125,7 +127,7 @@ def main(config):
         model = model.to(device)
 
         model_path = os.path.join(
-            'models', config['modelpath'] + str('_') + str(seed) + '.pt')
+            'results', 'models', config['modelpath'] + str('_') + str(seed) + '.pt')
         if Path(model_path).is_file():
             logger.info(f'Loading Model from {model_path}.')
             model.load_state_dict(torch.load(model_path, weights_only=True))
@@ -142,7 +144,7 @@ def main(config):
                     config['disease'], 'No Finding'],
                 bias_metric=config['metric'], batch_size=config['default']['batch_size'],
                 num_epochs=config['default']['n_epochs'])
-
+            Path(model_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), model_path)
 
         # Preliminaries
@@ -154,7 +156,7 @@ def main(config):
             if 'default' in results_valid and 'default' in results_test:
                 logger.info('Skipping Default Evaluation (already done).')
             else:
-                logger.info('Begining Default Evaluation...')
+                logger.info('Beginning Default Evaluation...')
                 results_valid['default'], results_test['default'] = evaluate_default_model(
                     model=model,
                     dataloaders=dataloaders,
@@ -169,7 +171,7 @@ def main(config):
             if 'random' in results_valid and 'random' in results_test:
                 logger.info('Skipping random Evaluation (already done).')
             else:
-                logger.info('Begining Random Evaluation...')
+                logger.info('Beginning Random Evaluation...')
                 results_valid['random'], results_test['random'] = evaluate_random_model(
                     model=model,
                     dataloaders=dataloaders,
@@ -184,7 +186,7 @@ def main(config):
             if 'ROC' in results_valid and 'ROC' in results_test:
                 logger.info('Skipping ROC Evaluation (already done).')
             else:
-                logger.info('Begining ROC Evaluation...')
+                logger.info('Beginning ROC Evaluation...')
                 results_valid['ROC'], results_test['ROC'] = evaluate_roc_model(
                     model=model,
                     dataloaders=dataloaders,
@@ -199,7 +201,7 @@ def main(config):
             if 'EqOdds' in results_valid and 'EqOdds' in results_test:
                 logger.info('Skipping EqOdds Evaluation (already done).')
             else:
-                logger.info('Begining EqOdds Evaluation...')
+                logger.info('Beginning EqOdds Evaluation...')
                 results_valid['EqOdds'], results_test['EqOdds'] = evaluate_eqod_model(
                     model=model,
                     dataloaders=dataloaders,
@@ -214,7 +216,7 @@ def main(config):
             if 'adversarial' in results_valid and 'adversarial' in results_test:
                 logger.info('Skipping adversarial Evaluation (already done).')
             else:
-                logger.info('Begining adversarial Evaluation...')
+                logger.info('Beginning adversarial Evaluation...')
                 dataloaders_adv, _ = loader_cache[config['adversarial']['batch_size']]
                 results_valid['adversarial'], results_test['adversarial'] = evaluate_adversarial_model(
                     model=model,
@@ -230,7 +232,7 @@ def main(config):
             if 'mitigating' in results_valid and 'mitigating' in results_test:
                 logger.info('Skipping mitigating Evaluation (already done).')
             else:
-                logger.info('Begining mitigating Evaluation...')
+                logger.info('Beginning mitigating Evaluation...')
                 dataloaders_mit, _ = loader_cache[config['mitigating']['batch_size']]
                 results_valid['mitigating'], results_test['mitigating'] = evaluate_mitigating_model(
                     model=model,
@@ -246,7 +248,7 @@ def main(config):
             if 'biasGrad' in results_valid and 'biasGrad' in results_test:
                 logger.info('Skipping biasGrad Evaluation (already done).')
             else:
-                logger.info('Begining biasGrad Evaluation...')
+                logger.info('Beginning biasGrad Evaluation...')
                 dataloaders_bg, _ = loader_cache[config['biasGrad']['batch_size']]
                 results_valid['biasGrad'], results_test['biasGrad'] = evaluate_biasgrad_model(
                     model=model,
@@ -263,16 +265,64 @@ def main(config):
             if 'pruning' in results_valid and 'pruning' in results_test:
                 logger.info('Skipping pruning Evaluation (already done).')
             else:
-                logger.info('Begining pruning Evaluation...')
+                logger.info('Beginning pruning Evaluation...')
                 dataloaders_pr, _ = loader_cache[config['pruning']['batch_size']]
-                results_valid['pruning'], results_test['pruning'] = evaluate_pruning_model(
-                    model=model,
-                    dataloaders=dataloaders_pr,
-                    dataset_sizes=dataset_sizes,
-                    config=config,
-                    device=device
-                )
+                with torch.no_grad():
+                    state_backup = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                
+                try:
+                    results_valid['pruning'], results_test['pruning'] = evaluate_pruning_model(
+                        model=model,
+                        dataloaders=dataloaders_pr,
+                        dataset_sizes=dataset_sizes,
+                        config=config,
+                        device=device
+                    )
+                    pruned_path = os.path.join('results', 'models',f"{config['modelpath']}_pruned_{seed}.pt")
+                    Path(pruned_path).parent.mkdir(parents=True, exist_ok=True)
+                    with torch.no_grad():
+                        torch.save({k: v.cpu() for k, v in model.state_dict().items()}, pruned_path)
+                    logger.info(f'Saved pruned model to {pruned_path}')
+                finally:
+                    model.cpu()
+                    model.load_state_dict(state_backup)
+                    model.to(device)
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                        logger.info("GPU cache cleared.")
                 save_checkpoint()
+
+        if 'adaptive_pruning' in config['models']:
+            if 'adaptive_pruning' in results_valid and 'adaptive_pruning' in results_test:
+                logger.info('Skipping adaptive_pruning Evaluation (already done).')
+            else:
+                logger.info('Beginning adaptive_pruning Evaluation...')
+                dataloaders_apr, _ = loader_cache[config['adaptive_pruning']['batch_size']]
+                with torch.no_grad():
+                    state_backup = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                try:
+                    results_valid['adaptive_pruning'], results_test['adaptive_pruning'] = evaluate_adaptive_pruning_model(
+                        model,
+                        dataloaders_apr,
+                        dataset_sizes,
+                        config,
+                        device,
+                    )
+                    pruned_path = os.path.join(
+                        'results', 'models',
+                        f"{config['modelpath']}adaptive_pruning{seed}.pt"
+                    )
+                    Path(pruned_path).parent.mkdir(parents=True, exist_ok=True)
+                    with torch.no_grad():
+                        torch.save({k: v.cpu() for k, v in model.state_dict().items()}, pruned_path)
+                    save_checkpoint()
+                finally:
+                    model.cpu()
+                    model.load_state_dict(state_backup)
+                    model.to(device)
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                        logger.info('GPU cache cleared.')
 
         logger.info(f'Validation Results: {results_valid}')
         logger.info(f'Test Results: {results_test}')

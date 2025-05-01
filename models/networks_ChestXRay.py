@@ -8,26 +8,19 @@ import copy
 import torch
 
 import torch.nn.functional as F
-from torch.amp import autocast, GradScaler
 
 import numpy as np
 
-from tqdm import tqdm
-
 from utils.evaluation import compute_empirical_bias, compute_accuracy_metrics
-from utils.logging_utils import get_logger
 
 from torch import nn
 
 from torchvision import models
 from torchvision.models import VGG16_Weights, ResNet18_Weights
 
-logger = get_logger("Chest XRay Network")
-
 
 class ChestXRayResNet18(nn.Module):
     """ResNet-18"""
-
     def __init__(self, pretrained=True):
         super().__init__()
         self.resnet18 = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
@@ -44,7 +37,6 @@ class ChestXRayResNet18(nn.Module):
 
 class ChestXRayVGG16(nn.Module):
     """VGG-16"""
-
     def __init__(self, pretrained=True):
         super().__init__()
         self.vgg16 = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
@@ -61,7 +53,6 @@ class ChestXRayVGG16(nn.Module):
 
 class ChestXRayVGG16Masked(nn.Module):
     """VGG-16 with masks applied to the specified layers. Used in pruning"""
-
     def __init__(self, base_model: ChestXRayVGG16, prunable_layers, start_idx, end_idx):
         super().__init__()
         self.all_layers = get_children(base_model)
@@ -91,21 +82,16 @@ class ChestXRayVGG16Masked(nn.Module):
                         cnt_ += t.shape[1]
                         cnt += 1
                     elif isinstance(l, nn.Conv2d):
-                        i_hat = (pruned_structs /
-                                 (t.shape[2] * t.shape[3])).astype(int)
-                        j_hat = (
-                            (pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
-                        k_hat = pruned_structs - \
-                            t.shape[2] * t.shape[3] * \
-                            i_hat - j_hat * t.shape[3]
+                        i_hat = (pruned_structs / (t.shape[2] * t.shape[3])).astype(int)
+                        j_hat = ((pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
+                        k_hat = pruned_structs - t.shape[2] * t.shape[3] * i_hat - j_hat * t.shape[3]
 
                         t[:, i_hat, j_hat, k_hat] = 0
 
                         cnt_ += t.shape[1] * t.shape[2] * t.shape[3]
                         cnt += 1
                     else:
-                        NotImplementedError(
-                            'ERROR: layer type not supported for masking!')
+                        NotImplementedError('ERROR: layer type not supported for masking!')
 
             # Apply ReLU activation to the features
             if i == len(self.all_layers) - 2:
@@ -136,21 +122,16 @@ class ChestXRayVGG16Masked(nn.Module):
                         cnt_ += t.shape[1]
                         cnt += 1
                     elif isinstance(l, nn.Conv2d):
-                        i_hat = (pruned_structs /
-                                 (t.shape[2] * t.shape[3])).astype(int)
-                        j_hat = (
-                            (pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
-                        k_hat = pruned_structs - \
-                            t.shape[2] * t.shape[3] * \
-                            i_hat - j_hat * t.shape[3]
+                        i_hat = (pruned_structs / (t.shape[2] * t.shape[3])).astype(int)
+                        j_hat = ((pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
+                        k_hat = pruned_structs - t.shape[2] * t.shape[3] * i_hat - j_hat * t.shape[3]
 
                         t[:, i_hat, j_hat, k_hat] = 0
 
                         cnt_ += t.shape[1] * t.shape[2] * t.shape[3]
                         cnt += 1
                     else:
-                        NotImplementedError(
-                            'ERROR: layer type not supported for masking!')
+                        NotImplementedError('ERROR: layer type not supported for masking!')
 
             # Apply ReLU activation to the VGG features
             if i == len(self.all_layers) - 2:
@@ -161,7 +142,6 @@ class ChestXRayVGG16Masked(nn.Module):
 
 class ChestXRayResNet18Masked(nn.Module):
     """ResNet-18 with masks applied to the specified layers. Used in pruning"""
-
     def __init__(self, base_model: ChestXRayResNet18, prunable_layers, start_idx, end_idx):
         super().__init__()
         self.all_layers = [base_model.resnet18.conv1, base_model.resnet18.bn1, base_model.resnet18.relu,
@@ -196,13 +176,9 @@ class ChestXRayResNet18Masked(nn.Module):
                         cnt_ += t.shape[1]
                         cnt += 1
                     elif len(t.shape) == 4:
-                        i_hat = (pruned_structs /
-                                 (t.shape[2] * t.shape[3])).astype(int)
-                        j_hat = (
-                            (pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
-                        k_hat = pruned_structs - \
-                            t.shape[2] * t.shape[3] * \
-                            i_hat - j_hat * t.shape[3]
+                        i_hat = (pruned_structs / (t.shape[2] * t.shape[3])).astype(int)
+                        j_hat = ((pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
+                        k_hat = pruned_structs - t.shape[2] * t.shape[3] * i_hat - j_hat * t.shape[3]
 
                         t[:, i_hat, j_hat, k_hat] = 0
 
@@ -240,13 +216,9 @@ class ChestXRayResNet18Masked(nn.Module):
                         cnt_ += t.shape[1]
                         cnt += 1
                     elif len(t.shape) == 4:
-                        i_hat = (pruned_structs /
-                                 (t.shape[2] * t.shape[3])).astype(int)
-                        j_hat = (
-                            (pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
-                        k_hat = pruned_structs - \
-                            t.shape[2] * t.shape[3] * \
-                            i_hat - j_hat * t.shape[3]
+                        i_hat = (pruned_structs / (t.shape[2] * t.shape[3])).astype(int)
+                        j_hat = ((pruned_structs - t.shape[2] * t.shape[3] * i_hat) / t.shape[3]).astype(int)
+                        k_hat = pruned_structs - t.shape[2] * t.shape[3] * i_hat - j_hat * t.shape[3]
 
                         t[:, i_hat, j_hat, k_hat] = 0
 
@@ -315,10 +287,9 @@ def train_ChestXRay_model(dataloaders, dataset_sizes, model, criterion, optimize
     val_bias = []
 
     # Iterate over epochs
-    scaler = GradScaler(enabled=(device.type == 'cuda'))
     for epoch in range(num_epochs):
-        logger.info(f'Epoch {epoch}/{num_epochs - 1}')
-        logger.info('-' * 10)
+        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+        print('-' * 10)
 
         # Each epoch has a training and validation phase
         for phase in ['train', 'val']:
@@ -340,10 +311,7 @@ def train_ChestXRay_model(dataloaders, dataset_sizes, model, criterion, optimize
             cnt = 0
 
             # Iterate over data
-            iterator = tqdm(dataloaders[phase],
-                            leave=False,
-                            disable=not logger.isEnabledFor(20))
-            for inputs, labels, attrs in iterator:
+            for inputs, labels, attrs in dataloaders[phase]:
                 # Send inputs and labels to the device
                 inputs = inputs.to(device)
                 labels = labels.to(device).to(torch.float)
@@ -354,25 +322,18 @@ def train_ChestXRay_model(dataloaders, dataset_sizes, model, criterion, optimize
 
                 # Forward
                 with torch.set_grad_enabled(phase == 'train'):
-                    with autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-                        outputs = model(inputs)
-                        preds = outputs[:, 0] > 0.5
-                        loss = criterion(outputs[:, 0], labels)
-                    
-                    probs_mat[cnt * batch_size:(cnt + 1) *
-                              batch_size] = outputs[:, 0].cpu().detach().numpy()
-                    preds_vec[cnt * batch_size:(cnt + 1) *
-                              batch_size] = preds.cpu().detach().numpy()
-                    labels_vec[cnt * batch_size:(cnt + 1) *
-                               batch_size] = labels.cpu().detach().numpy()
-                    priv[cnt * batch_size:(cnt + 1) *
-                         batch_size] = attrs.cpu().detach().numpy()
+                    outputs = model(inputs)
+                    preds = outputs[:, 0] > 0.5
+                    loss = criterion(outputs[:, 0], labels)
+                    probs_mat[cnt * batch_size:(cnt + 1) * batch_size] = outputs[:, 0].cpu().detach().numpy()
+                    preds_vec[cnt * batch_size:(cnt + 1) * batch_size] = preds.cpu().detach().numpy()
+                    labels_vec[cnt * batch_size:(cnt + 1) * batch_size] = labels.cpu().detach().numpy()
+                    priv[cnt * batch_size:(cnt + 1) * batch_size] = attrs.cpu().detach().numpy()
 
                     # Backward + optimize only if in the training phase
                     if phase == 'train':
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
+                        loss.backward()
+                        optimizer.step()
 
                 # Statistics
                 running_loss += loss.item() * inputs.size(0)
@@ -385,11 +346,9 @@ def train_ChestXRay_model(dataloaders, dataset_sizes, model, criterion, optimize
                 scheduler.step()
 
             # Get the predictive performance metrics
-            auroc, avg_precision, balanced_acc, f1_acc = compute_accuracy_metrics(
-                preds_vec, labels_vec)
+            auroc, avg_precision, balanced_acc, f1_acc = compute_accuracy_metrics(preds_vec, labels_vec)
             if phase == 'val':
-                bias = compute_empirical_bias(
-                    preds_vec, labels_vec, priv, bias_metric)
+                bias = compute_empirical_bias(preds_vec, labels_vec, priv, bias_metric)
                 print('Bias:', bias)
             acc = running_corrects.double() / dataset_sizes[phase]
 
@@ -434,8 +393,7 @@ class Critic(nn.Module):
     def __init__(self, sizein, num_deep=3, hid=32):
         super().__init__()
         self.fc0 = nn.Linear(sizein, hid)
-        self.fcs = nn.ModuleList([nn.Linear(hid, hid)
-                                 for _ in range(num_deep)])
+        self.fcs = nn.ModuleList([nn.Linear(hid, hid) for _ in range(num_deep)])
         self.dropout = nn.Dropout(0.2)
         self.out = nn.Linear(hid, 1)
 
