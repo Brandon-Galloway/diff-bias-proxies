@@ -23,9 +23,7 @@ from utils.logging_utils import get_logger
 
 from tqdm import tqdm
 
-from collections import OrderedDict
-
-from typing import Dict, Callable
+from sklearn.cluster import KMeans
 
 logger = get_logger("Pruning Model Debiasing")
 
@@ -35,7 +33,7 @@ def evaluate_adaptive_pruning_model(model, dataloaders, dataset_sizes, config, d
     Perform structured pruning on the model and evaluate its performance.
     Returns dicts keyed by 'pruning' for validation and test results.
     """
-    batch_size = config['pruning']['batch_size']
+    batch_size = config['adaptive_pruning']['batch_size']
     # Select layer map based on architecture
     arch = config['default']['arch']
     if arch == 'resnet':
@@ -86,6 +84,9 @@ def evaluate_adaptive_pruning_model(model, dataloaders, dataset_sizes, config, d
         logger.info("Test evaluation completed.")
 
     logger.info("Finding best threshold for pruned model.")
+    T = config['adaptive_pruning'].get('temperature', 1.5)
+    valid_scores = temperature_scale(valid_scores, T)
+    test_scores = temperature_scale(test_scores, T)
     best_thresh = find_best_threshold(valid_scores, y_valid, config['acc_metric'])
     logger.info("Best threshold for pruning: %.4f", best_thresh)
 
@@ -113,7 +114,8 @@ def evaluate_adaptive_pruning_model(model, dataloaders, dataset_sizes, config, d
     return {'pruning': valid_obj}, {'pruning': test_obj}
 
 
-
+def temperature_scale(logits: np.ndarray, temperature: float) -> np.ndarray:
+    return logits / temperature
 
 
 def choose_best_thresh_bal_acc(data: utils.data_utils.TabularData, valid_pred_scores: np.ndarray, n_thresh=101):
@@ -131,14 +133,17 @@ def choose_best_thresh_bal_acc(data: utils.data_utils.TabularData, valid_pred_sc
 def choose_best_thresh_bal_acc_(y_valid: np.ndarray, valid_pred_scores: np.ndarray, n_thresh=101):
     """Optimises classification threshold w.r.t. balanced accuracy"""
     # NOTE: this function is applied directly to numpy arrays, rather than a TabularData object
-    threshs = np.linspace(0, 1, n_thresh)
-    performances = []
-    for thresh in threshs:
-        perf = balanced_accuracy_score(y_valid, valid_pred_scores > thresh)
-        performances.append(perf)
-    best_thresh = threshs[np.argmax(performances)]
+    # Coarse pass
+    coarse_threshs = np.linspace(0, 1, n_thresh)
+    coarse_scores = [balanced_accuracy_score(y_valid, valid_pred_scores > t) for t in coarse_threshs]
+    best_thresh = coarse_threshs[np.argmax(coarse_scores)]
 
-    return best_thresh
+    # Fine-tune around best
+    fine_range = np.clip(np.linspace(best_thresh - 0.05, best_thresh + 0.05, 51), 0, 1)
+    fine_scores = [balanced_accuracy_score(y_valid, valid_pred_scores > t) for t in fine_range]
+    best_fine_thresh = fine_range[np.argmax(fine_scores)]
+
+    return best_fine_thresh
 
 
 def save_pruning_trajectory(results: dict, seed: int, config: dict):
@@ -160,7 +165,8 @@ def install_hooks(layers, names=None, get_n_units=False):
 
     def get_activation(name):
         def hook(_, __, output):
-            output.retain_grad()
+            if getattr(output, 'requires_grad', False):
+                output.retain_grad()
             activation[name] = output
         return hook
 
@@ -179,48 +185,10 @@ def remove_all_forward_hooks(model: torch.nn.Module) -> None:
         child._forward_hooks.clear()
         remove_all_forward_hooks(child)
 
-
-def eval_saliency(model: nn.Module, data: utils.data_utils.TabularData, idx: np.ndarray,
-                  activation: dict, config: dict, total_n_units: int, val_only=False):
-    model.eval()
-    model.zero_grad()
-
-    X = data.X_valid if val_only else data.X_train
-    preds = model(X[idx])[:, 0]
-
-    coeffs = np.zeros(total_n_units)
-
-    if config['metric'] == 'spd':
-        p = data.p_valid if val_only else data.p_train
-        bias_measure = preds[p[idx] == 0].mean() - preds[p[idx] == 1].mean()
-    elif config['metric'] == 'eod':
-        p = data.p_valid if val_only else data.p_train
-        y = data.y_valid if val_only else data.y_train
-        mask = y[idx] == 1
-        bias_measure = preds[np.logical_and(p[idx] == 0, mask)].mean() - preds[np.logical_and(p[idx] == 1, mask)].mean()
-    else:
-        raise NotImplementedError('Bias metric not supported!')
-
-    bias_measure.backward()
-
-    offset = 0
-    grads_fc0 = activation['fc0'].grad.sum(0).cpu().numpy()
-    coeffs[offset:offset + model.fc0.out_features] = grads_fc0
-    offset += model.fc0.out_features
-
-    for i, fc in enumerate(model.fcs):
-        grads = activation[f'fc{i + 1}'].grad.sum(0).cpu().numpy()
-        coeffs[offset:offset + fc.out_features] = grads
-        offset += fc.out_features
-
-    return coeffs
-
-
 def eval_saliency_dataloaders(model, layers, data_loader, activation, device, config, pruned=None):
     logger.info('Evaluating gradient-based bias influence (saliency scores)...')
-    
-    model.eval()
 
+    model.eval()
     dummy_input = torch.zeros((1, 3, 224, 224), device=device)
     _ = model(dummy_input)
 
@@ -281,339 +249,135 @@ def eval_saliency_dataloaders(model, layers, data_loader, activation, device, co
                     raise NotImplementedError('Layer type not supported!')
                 coeffs[start_idx[i]:end_idx[i]] += sal.detach().cpu().numpy()
 
-    return coeffs, n_structs, start_idx, end_idx
+    saliency_per_unit = []
+    for i, key in enumerate(layer_keys):
+        if isinstance(layers[i], nn.Linear):
+            n = layers[i].out_features
+        elif isinstance(layers[i], nn.Conv2d):
+            act = activation[key]
+            n = act.shape[1] * act.shape[2] * act.shape[3]
+        else:
+            raise NotImplementedError()
 
+        saliency_per_unit.extend(coeffs[start_idx[i]:end_idx[i]].tolist())
 
-
-def prune_fc_units(model: nn.Module, to_prune: np.ndarray, n_units: dict, prune_first=False):
-    """Prunes specified units in the fully connected layers by adjusting weight matrices"""
-    if len(to_prune) == 0:
-        return model
-    cnt = 0
-    if prune_first:
-        n_units_i = n_units['fc0']
-        # Find units to prune in this layer
-        pruned_units_i = to_prune[np.logical_and(cnt <= to_prune, to_prune < cnt + n_units_i)] - cnt
-        # Set incoming weights to 0
-        model.fc0.weight[pruned_units_i, :] = 0
-        model.fc0.bias[pruned_units_i] = 0
-        cnt += n_units_i
-    for (i, fc) in enumerate(model.fcs):
-        n_units_i = n_units['fc' + str(i + 1)]
-        # Find units to prune in this layer
-        pruned_units_i = to_prune[np.logical_and(cnt <= to_prune, to_prune < cnt + n_units_i)] - cnt
-        # Set incoming weights to 0
-        fc.weight[pruned_units_i, :] = 0
-        fc.bias[pruned_units_i] = 0
-        cnt += n_units_i
-    return model
-
-
-def prune_fc(model, data, config, seed, plot=False, display=False):
-    """Intra-processing debiasing procedure for pruning fully connected neural networks"""
-    # Suppress warnings
-    import warnings
-    warnings.filterwarnings("ignore", category=UserWarning)
-    logger.info('Starting fully connected network pruning...')
-
-    model_pruned = copy.deepcopy(model)
-
-    # Determine the order in which structures are pruned, similar to bias GD/A
-    # Predict on validation data
-    with torch.enable_grad():
-        # Predict on validation set
-        valid_pred_scores = model_pruned(data.X_valid)[:, 0].reshape(-1, 1).detach().numpy()
-    # Choose the best threshold w.r.t. the balanced accuracy on the held-out data
-    best_thresh = choose_best_thresh_bal_acc(data=data, valid_pred_scores=valid_pred_scores)
-    # Evaluate all metrics using the best threshold
-    obj_dict = get_objective((valid_pred_scores > best_thresh) * 1., data.y_valid.numpy(), data.p_valid,
-                             config['metric'], config['objective']['sharpness'],
-                             config['objective']['epsilon'])
-    asc = obj_dict['bias'] < 0
-
-    # Create hooks to get layer activations from the model
-    activation, n_units = install_hooks_fc(model=model_pruned)
-
-    total_n_units = sum(list(n_units.values()))
-
-    if not config['pruning']['val_only']:
-        idx = np.arange(0, data.X_train.size(0))
-    else:
-        idx = np.arange(0, data.X_valid.size(0))
-
-    # Evaluate unit gradient-based bias influence
-    coeffs = eval_saliency(model=model_pruned, data=data, idx=idx, activation=activation, config=config,
-                           total_n_units=total_n_units, val_only=config['pruning']['val_only'])
-
-    # Sort the units according to their influence and the sign of the initial bias
-    if asc:
-        unit_inds = np.argsort(coeffs)
-    else:
-        unit_inds = np.argsort(-coeffs)
-
-    model_pruned.eval()
-
-    objective = []
-    bias_metric = []
-    pred_performance = []
-    n_pruned = []
-    pruned_inds = []
-    pruned = []
-    model_pruned_ = copy.deepcopy(model_pruned)
-    start_ind = 0
-
-    j_best = -1
-    best_bias = 1
-
-    prune_bar = tqdm(total=int((len(unit_inds) + 1) / config['pruning']['step_size']), desc='Pruning Steps')
-    with torch.no_grad():
-        # Prune units step-by-step measuring performance changes for every sparsity level
-        for j in range(0, len(unit_inds) + 1, config['pruning']['step_size']):
-            # Recompute influence dynamically for pruned networks
-            logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: Starting...')
-            
-            if config['pruning']['dynamic'] and j > 1:
-                logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: Recomputing saliency scores...')
-                with torch.enable_grad():
-                    coeffs = eval_saliency(model=model_pruned_, data=data, idx=idx, activation=activation,
-                                           config=config, total_n_units=total_n_units,
-                                           val_only=config['pruning']['val_only'])
-                    if asc:
-                        unit_inds = np.argsort(coeffs)
-                    else:
-                        unit_inds = np.argsort(-coeffs)
-                logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: Saliency scores recomputed.')
-
-            # NOTE: evaluate unpruned network as well (in case it is not biased)
-            if j > 0:
-                # Prune top salient units
-                to_prune = unit_inds[start_ind:(start_ind + config['pruning']['step_size'])]
-            else:
-                to_prune = []
-
-            if not config['pruning']['dynamic']:
-                start_ind += config['pruning']['step_size']
-
-            logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: Pruning {len(to_prune)} units...')
-
-            for unit in tqdm(to_prune, desc=f'Pruning Units (Step {j // config["pruning"]["step_size"]})', leave=False):
-                pruned.append(unit)
-            
-            pruned_inds.append(copy.deepcopy(pruned))
-            # Prune the network
-            model_pruned_ = prune_fc_units(model=model_pruned_, to_prune=to_prune, n_units=n_units, prune_first=True)
-
-            # Predict on the validation set
-            logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: Running validation forward pass...')
-            with torch.enable_grad():
-                valid_pred_scores = model_pruned_(data.X_valid)[:, 0].reshape(-1, 1).detach().numpy()
-
-            # Choose the best threshold w.r.t. the balanced accuracy on the held-out data
-            logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: Searching for best threshold...')
-            best_thresh = choose_best_thresh_bal_acc(data=data, valid_pred_scores=valid_pred_scores)
-
-            # Evaluate all metrics using the best threshold
-            logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: Evaluating performance metrics...')
-            obj_dict = get_objective((valid_pred_scores > best_thresh) * 1., data.y_valid.numpy(), data.p_valid,
-                                     config['metric'], config['objective']['sharpness'],
-                                     config['objective']['epsilon'])
-
-            objective.append(obj_dict['objective'])
-            bias_metric.append(obj_dict['bias'])
-            pred_performance.append(obj_dict['performance'])
-            n_pruned.append(j)
-
-            # Save the least biased model that satisfies the specified constraint on the performance
-            logger.info(f'Pruning step {j // config["pruning"]["step_size"]}: '
-                    f'Bias={obj_dict["bias"]:.4f}, Performance={obj_dict["performance"]:.4f}, Objective={obj_dict["objective"]:.4f}')
-            if np.abs(obj_dict['bias']) < best_bias and obj_dict['performance'] >= config['pruning']['obj_lb']:
-                best_bias = np.abs(obj_dict['bias'])
-                j_best = len(objective) - 1
-
-            # Stop pruning if accuracy drops below 52%
-            if config['pruning']['stop_early'] and obj_dict['performance'] < 0.52:
-                logger.info('Early stopping: performance dropped too low.')
-                logger.warning('WARNING: Early stopping does not support F1-score!')
-                prune_bar.close()
-                break
-
-            prune_bar.update(1)
-
-        prune_bar.close()
-
-        if j_best == -1:
-            logger.info('WARNING: No debiased model satisfies the constraints!')
-            j_best = 0
-
-        # Plot performance traces
-        if plot:
-            logger.info('Plotting pruning results...')
-            plot_pruning_results(n_pruned=n_pruned, total_n_units=total_n_units, objective=objective,
-                                 bias_metric=bias_metric, pred_performance=pred_performance, j_best=j_best,
-                                 seed=seed, config=config, display=display)
-
-        # Save performance traces
-        logger.info('Saving pruning trajectory...')
-        save_pruning_trajectory(
-            results={'objective': pred_performance * (np.abs(bias_metric) < config['objective']['epsilon']),
-                     'bias': bias_metric,
-                     'perf': pred_performance},
-            seed=seed, config=config)
-
-        # List of units pruned in the optimal model
-        to_prune = np.array(pruned_inds[j_best])
-
-        # Construct the best model
-        logger.info('Building final pruned model.')
-        with torch.no_grad():
-            model_pruned = copy.deepcopy(model)
-            model_pruned.eval()
-
-            # Prune the final model
-            model_pruned = prune_fc_units(model=model_pruned, to_prune=to_prune, n_units=n_units, prune_first=True)
-    logger.info('Pruning complete. Returning final model.')
-    return model_pruned
-
+    saliency_array = np.array(saliency_per_unit).reshape(-1, 1)
+    return saliency_array, n_structs, start_idx, end_idx
 
 def prune(model, layer_map, data_loader_train, data_loader_val, dataset_size_val, config, seed, device, arch='vgg',
           plot=False, display=False):
     import warnings
     warnings.filterwarnings("ignore", category=UserWarning)
 
+    # prepare layers and hooks
     layers = layer_map(model)
     activation, handles = install_hooks(layers=layers)
     model.eval()
 
-    logger.info('Starting network pruning...')
-    logger.info('Evaluating original model before pruning...')
-
-    valid_pred_scores, y_valid, p_valid = np.zeros(dataset_size_val), np.zeros(dataset_size_val), np.zeros(dataset_size_val)
-
-    for i, (X, y, p) in enumerate(tqdm(data_loader_val, desc='Initial Validation', leave=False)):
+    # initial validation on unpruned model
+    valid_scores = np.zeros(dataset_size_val)
+    y_valid = np.zeros(dataset_size_val)
+    p_valid = np.zeros(dataset_size_val)
+    for i, (X, y, p) in enumerate(data_loader_val):
         X, y, p = X.to(device), y.to(device).float(), p.to(device)
-        with torch.enable_grad():
-            outputs = model(X)
-        start = i * config['pruning']['batch_size']
-        end = (i + 1) * config['pruning']['batch_size']
-        valid_pred_scores[start:end] = outputs[:, 0].detach().cpu().numpy()
-        y_valid[start:end] = y.detach().cpu().numpy()
-        p_valid[start:end] = p.detach().cpu().numpy()
+        with torch.no_grad():
+            out = model(X)
+        start = i * config['adaptive_pruning']['batch_size']
+        end = (i + 1) * config['adaptive_pruning']['batch_size']
+        valid_scores[start:end] = out[:, 0].cpu().numpy()
+        y_valid[start:end] = y.cpu().numpy(); p_valid[start:end] = p.cpu().numpy()
+    best_t = choose_best_thresh_bal_acc_(y_valid, valid_scores)
+    init_obj = get_test_objective_(y_pred=(valid_scores > best_t).astype(float), y_test=y_valid, p_test=p_valid, config=config)
+    asc = init_obj['bias'] < 0
 
-    best_thresh = choose_best_thresh_bal_acc_(y_valid=y_valid, valid_pred_scores=valid_pred_scores)
-    obj_dict = get_test_objective_(
-        y_pred=(valid_pred_scores > best_thresh).astype(float),
-        y_test=y_valid,
-        p_test=p_valid,
-        config=config
-    )
-
-    objective, bias_metric, pred_performance = [obj_dict['objective']], [obj_dict['bias']], [obj_dict['performance']]
-    n_pruned, pruned_inds, pruned = [[0]], [[]], []
-    j_best, best_bias, to_prune_best = -1, 1.0, None
-    asc = obj_dict['bias'] < 0
-
+    # compute initial saliency
     logger.info('Computing initial saliency scores...')
     model.zero_grad()
     coeffs, n_structs, start_idx, end_idx = eval_saliency_dataloaders(
         model=model, layers=layers, data_loader=data_loader_train,
         activation=activation, device=device, config=config
     )
-    struct_inds = np.argsort(coeffs if asc else -coeffs)
 
-    logger.info(f'Building masked model architecture: {arch}')
+    # compute weight magnitudes aligned to coeffs
+    mags = []
+    for layer, count in zip(layers, n_structs):
+        if isinstance(layer, torch.nn.Linear):
+            w = layer.weight.detach().abs().sum(dim=1).cpu().numpy()
+            mags.append(w)
+        elif isinstance(layer, torch.nn.Conv2d):
+            w = layer.weight.detach().abs().sum(dim=(1,2,3)).cpu().numpy()
+            repeat = count // w.shape[0]
+            mags.append(np.repeat(w, repeat))
+        else:
+            raise NotImplementedError
+    weight_mags = np.concatenate(mags)
+
+    # clustering by (saliency, weight)
+    sal = coeffs.flatten()
+    norm_sal = (sal - sal.min()) / (sal.ptp() + 1e-8)
+    norm_wm  = (weight_mags - weight_mags.min()) / (weight_mags.ptp() + 1e-8)
+    X_feat = np.stack([norm_sal, norm_wm], axis=1)
+    k = config['adaptive_pruning'].get('n_clusters', 50)
+    labels = KMeans(n_clusters=k).fit_predict(X_feat)
+
+    # score clusters by signed mean saliency
+    direction = 1 if asc else -1
+    scores = np.array([direction * sal[labels == c].mean() for c in range(k)])
+    order = np.argsort(-scores)
+
+    # build pruning order list
+    struct_order = np.concatenate([np.where(labels == c)[0] for c in order])
+
+    # prepare masked model
+    logger.info(f"Building masked model architecture: {arch}")
     if arch == 'vgg':
         model = ChestXRayVGG16Masked(model, layers, start_idx, end_idx)
     elif arch == 'resnet':
         model = ChestXRayResNet18Masked(model, layers, start_idx, end_idx)
     else:
-        raise ValueError('Network architecture not supported!')
+        raise ValueError('Unsupported arch')
+    model.eval()
 
-    step_num = 0
-    prune_bar = tqdm(total=(len(struct_inds) + 1) // config['pruning']['step_size'], desc='Pruning Steps')
+    # iterative pruning
+    pruned = []
+    traj = {'objective': [], 'bias': [], 'performance': []}
+    step_sz = config['adaptive_pruning']['step_size']
+    for step, j in enumerate(range(0, len(struct_order), step_sz)):
+        to_prune = struct_order[j:j+step_sz]
+        pruned.extend(to_prune.tolist())
 
-    for j in range(0, len(struct_inds), config['pruning']['step_size']):
-        if config['pruning']['dynamic'] and j > 0:
-            logger.info('Recomputing saliency scores...')
+        # validation after prune
+        valid_scores.fill(0); y_valid.fill(0); p_valid.fill(0)
+        for i, (X, y, p) in enumerate(data_loader_val):
+            X, y, p = X.to(device), y.to(device).float(), p.to(device)
+            with torch.no_grad():
+                out = model(X, pruned=np.array(pruned, dtype=int))
+            start = i * config['adaptive_pruning']['batch_size']
+            end = (i + 1) * config['adaptive_pruning']['batch_size']
+            valid_scores[start:end] = out[:, 0].cpu().numpy()
+            y_valid[start:end] = y.cpu().numpy(); p_valid[start:end] = p.cpu().numpy()
+        t = choose_best_thresh_bal_acc_(y_valid, valid_scores)
+        obj = get_test_objective_(y_pred=(valid_scores > t).astype(float), y_test=y_valid, p_test=p_valid, config=config)
+
+        traj['objective'].append(obj['objective'])
+        traj['bias'].append(obj['bias'])
+        traj['performance'].append(obj['performance'])
+
+        logger.info(f"Prune Step {step}: Bias={obj['bias']:.4f}, Performance={obj['performance']:.4f}, Objective={obj['objective']:.4f}")
+        if step_sz * (step + 1) >= len(struct_order):
+            break
+        if config['adaptive_pruning'].get('dynamic', False):
+            # recalc saliency on current pruned model
             model.zero_grad()
             coeffs, _, _, _ = eval_saliency_dataloaders(
                 model=model, layers=layers, data_loader=data_loader_train,
                 activation=activation, device=device, config=config, pruned=pruned
             )
-            struct_inds = np.argsort(coeffs if asc else -coeffs)
+            sal = coeffs.flatten()
+            norm_sal = (sal - sal.min()) / (sal.ptp() + 1e-8)
+            labels = KMeans(n_clusters=k).fit_predict(np.stack([norm_sal, norm_wm], axis=1))
+            scores = np.array([direction * sal[labels == c].mean() for c in range(k)])
+            order = np.argsort(-scores)
+            struct_order = np.concatenate([np.where(labels == c)[0] for c in order])
 
-        to_prune = struct_inds[len(pruned):len(pruned) + config['pruning']['step_size']]
-        pruned.extend(to_prune)
-        pruned_inds.append(pruned.copy())
-
-        valid_pred_scores.fill(0)
-        y_valid.fill(0)
-        p_valid.fill(0)
-
-        for i, (X, y, p) in enumerate(tqdm(data_loader_val, desc=f'Validation after {len(pruned)} Prunes', leave=False)):
-            model.zero_grad()
-            X, y, p = X.to(device), y.to(device).float(), p.to(device)
-            with torch.enable_grad():
-                outputs = model(X, pruned=np.array(pruned))
-            start = i * config['pruning']['batch_size']
-            end = (i + 1) * config['pruning']['batch_size']
-            valid_pred_scores[start:end] = outputs[:, 0].detach().cpu().numpy()
-            y_valid[start:end] = y.detach().cpu().numpy()
-            p_valid[start:end] = p.detach().cpu().numpy()
-
-        best_thresh = choose_best_thresh_bal_acc_(y_valid=y_valid, valid_pred_scores=valid_pred_scores)
-        obj_dict = get_test_objective_(
-            y_pred=(valid_pred_scores > best_thresh).astype(float),
-            y_test=y_valid,
-            p_test=p_valid,
-            config=config
-        )
-
-        objective.append(obj_dict['objective'])
-        bias_metric.append(obj_dict['bias'])
-        pred_performance.append(obj_dict['performance'])
-        n_pruned.append(j)
-
-        if abs(obj_dict['bias']) < best_bias and obj_dict['performance'] >= config['pruning']['obj_lb']:
-            best_bias, j_best, to_prune_best = abs(obj_dict['bias']), len(objective) - 1, pruned.copy()
-
-        logger.info(f"Prune Step {j // config['pruning']['step_size']}: Bias={obj_dict['bias']:.4f}, "
-                    f"Performance={obj_dict['performance']:.4f}, Objective={obj_dict['objective']:.4f}")
-
-        if config['pruning']['stop_early']:
-            if obj_dict['performance'] <= 0.55:
-                logger.info('Early stopping: performance too low.')
-                break
-            if step_num >= config['pruning']['max_steps']:
-                logger.info('Early stopping: reached max steps.')
-                break
-
-        step_num += 1
-        prune_bar.update(1)
-
-    prune_bar.close()
-
-    if plot:
-        logger.info('Plotting pruning results...')
-        plot_pruning_results(
-            n_pruned=n_pruned, total_n_units=len(coeffs), objective=objective,
-            bias_metric=bias_metric, pred_performance=pred_performance, j_best=j_best,
-            seed=seed, config=config, display=display
-        )
-
-    logger.info('Saving pruning performance trajectory...')
-    save_pruning_trajectory({
-        'objective': pred_performance * (np.abs(bias_metric) < config['objective']['epsilon']),
-        'bias': bias_metric,
-        'perf': pred_performance
-    }, seed=seed, config=config)
-
-    logger.info('Cleaning up hooks...')
-    remove_all_forward_hooks(model)
-    for h in handles.values():
-        h.remove()
-    
-    if to_prune_best is None:
-        logger.warning('No valid pruned model met the performance constraint. Returning original model with no pruning.')
-        to_prune_best = np.array([], dtype=int)
-
-    return model, np.array(to_prune_best)
+    return model, lambda x: None

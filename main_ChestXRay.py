@@ -21,6 +21,7 @@ from algorithms.mitigating import evaluate_mitigating_model
 from algorithms.pruning import evaluate_pruning_model
 from algorithms.biasGrad import evaluate_biasgrad_model
 from algorithms.adaptivePruning import evaluate_adaptive_pruning_model
+from algorithms.engineeredBiasGrad import evaluate_enginneeredBiasGrad_model
 
 
 from datasets.chestxray_dataset import get_ChestXRay_mimic_dataloaders
@@ -79,7 +80,7 @@ def main(config):
 
     # Set up dataloader cache in advance
     batch_sizes = {config['default']['batch_size']}
-    for key in ['adversarial','mitigating','biasGrad','pruning', 'adaptive_pruning']:
+    for key in ['adversarial','mitigating','biasGrad','pruning', 'adaptive_pruning', 'engineeredBiasGrad']:
         if key in config['models']:
             batch_sizes.add(config[key]['batch_size'])
 
@@ -251,6 +252,22 @@ def main(config):
                 logger.info('Beginning biasGrad Evaluation...')
                 dataloaders_bg, _ = loader_cache[config['biasGrad']['batch_size']]
                 results_valid['biasGrad'], results_test['biasGrad'] = evaluate_biasgrad_model(
+                    model=model,
+                    dataloaders=dataloaders_bg,
+                    dataset_sizes=dataset_sizes,
+                    config=config,
+                    device=device
+                )
+                save_checkpoint()
+        
+        # Evaluate bias gradient descent/ascent
+        if 'engineeredBiasGrad' in config['models']:
+            if 'engineeredBiasGrad' in results_valid and 'engineeredBiasGrad' in results_test:
+                logger.info('Skipping engineeredBiasGrad Evaluation (already done).')
+            else:
+                logger.info('Beginning engineeredBiasGrad Evaluation...')
+                dataloaders_bg, _ = loader_cache[config['engineeredBiasGrad']['batch_size']]
+                results_valid['engineeredBiasGrad'], results_test['engineeredBiasGrad'] = evaluate_engineeredBiasGrad_model(
                     model=model,
                     dataloaders=dataloaders_bg,
                     dataset_sizes=dataset_sizes,
