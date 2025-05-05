@@ -170,7 +170,11 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
 
     loss_fn_fair = spd_diff if config['metric'] == 'spd' else eod_diff
     loss_fn_base = nn.BCEWithLogitsLoss()
-    lambda_fair = config['engineeredBiasGrad'].get('lambda_fair', 1.0)
+    #lambda_fair = config['engineeredBiasGrad'].get('lambda_fair', 1.0)
+
+    base_lambda = config['engineeredBiasGrad'].get('lambda_fair', 1.0)
+    warmup_type = config['engineeredBiasGrad'].get('lambda_schedule', 'linear')
+    warmup_factor = config['engineeredBiasGrad'].get('lambda_warmup_factor', 5)
 
     optimiser = opt_alg(params=model_.parameters(), lr=config['engineeredBiasGrad']['lr'])
 
@@ -223,6 +227,13 @@ def bias_gda_dataloaders(model: nn.Module, data_loader_train: DataLoader, data_l
         logger.info(f'Starting epoch {i+1}')
         eval_factor = max(1, int(len(data_loader_train) / config['engineeredBiasGrad']['n_evals']))
         batch_cnt = 0
+
+        if warmup_type == 'linear':
+            lambda_fair = base_lambda * (i + 1) / config['engineeredBiasGrad']['n_epochs']
+        elif warmup_type == 'exp':
+            lambda_fair = base_lambda * (1 - np.exp(-(i + 1) / warmup_factor))
+        else:
+            lambda_fair = base_lambda
 
         batch_bar = tqdm(data_loader_train, desc=f'Epoch {i+1} Batches', leave=False)
         for X, y, p in batch_bar:

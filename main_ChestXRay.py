@@ -21,7 +21,7 @@ from algorithms.mitigating import evaluate_mitigating_model
 from algorithms.pruning import evaluate_pruning_model
 from algorithms.biasGrad import evaluate_biasgrad_model
 from algorithms.adaptivePruning import evaluate_adaptive_pruning_model
-from algorithms.engineeredBiasGrad import evaluate_enginneeredBiasGrad_model
+from algorithms.engineeredBiasGrad import evaluate_engineeredBiasGrad_model
 
 
 from datasets.chestxray_dataset import get_ChestXRay_mimic_dataloaders
@@ -314,38 +314,34 @@ def main(config):
                 logger.info('Skipping adaptive_pruning Evaluation (already done).')
             else:
                 logger.info('Beginning adaptive_pruning Evaluation...')
-                dataloaders_apr, _ = loader_cache[config['adaptive_pruning']['batch_size']]
-                with torch.no_grad():
-                    state_backup = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                try:
-                    results_valid['adaptive_pruning'], results_test['adaptive_pruning'] = evaluate_adaptive_pruning_model(
-                        model,
-                        dataloaders_apr,
-                        dataset_sizes,
-                        config,
-                        device,
-                    )
-                    pruned_path = os.path.join(
-                        'results', 'models',
-                        f"{config['modelpath']}adaptive_pruning{seed}.pt"
-                    )
-                    Path(pruned_path).parent.mkdir(parents=True, exist_ok=True)
-                    with torch.no_grad():
-                        torch.save({k: v.cpu() for k, v in model.state_dict().items()}, pruned_path)
-                    save_checkpoint()
-                finally:
-                    model.cpu()
-                    model.load_state_dict(state_backup)
+                pruned_path = os.path.join('results', 'models', f"{config['modelpath']}_pruned_{seed}.pt")
+                if Path(pruned_path).is_file():
+                    model.load_state_dict(torch.load(pruned_path, map_location='cpu'))
                     model.to(device)
-                    if device.type == 'cuda':
-                        torch.cuda.empty_cache()
-                        logger.info('GPU cache cleared.')
+                else:
+                    dataloaders_pr, _ = loader_cache[config['pruning']['batch_size']]
+                    evaluate_pruning_model(
+                        model=model,
+                        dataloaders=dataloaders_pr,
+                        dataset_sizes=dataset_sizes,
+                        config=config,
+                        device=device
+                    )
+                dataloaders_ebg, _ = loader_cache[config['engineeredBiasGrad']['batch_size']]
+                results_valid['adaptive_pruning'], results_test['adaptive_pruning'] = evaluate_engineeredBiasGrad_model(
+                    model=model,
+                    dataloaders=dataloaders_ebg,
+                    dataset_sizes=dataset_sizes,
+                    config=config,
+                    device=device
+                )
+                save_checkpoint()
 
-        logger.info(f'Validation Results: {results_valid}')
-        logger.info(f'Test Results: {results_test}')
+                logger.info(f'Validation Results: {results_valid}')
+                logger.info(f'Test Results: {results_test}')
 
-        del model, dataloaders
-        torch.cuda.empty_cache()
+                del model, dataloaders
+                torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':

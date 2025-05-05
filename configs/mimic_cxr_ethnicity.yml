@@ -4,16 +4,18 @@ experiment_name: mimic_cxr_ethnicity_eod
 dataset: chestxray_mimic
 protected: ethnicity
 priv_class: WHITE
-unpriv_class: HISPANIC/LATINO
+unpriv_class: HISPANIC OR LATINO
 prot_ratio: 0.75
 disease: Pneumonia
 metric: eod
 acc_metric: balanced_accuracy
 modelpath: chestxray_mimic_pneumonia_0_75_ethnicity_vgg
-num_workers: 2
+num_workers: 8
+
 objective:
   sharpness: 500.
   epsilon: 0.05
+
 models:
   - default
   - ROC
@@ -23,36 +25,42 @@ models:
   - mitigating
   - pruning
   - biasGrad
+
 default:
   batch_size: 32
   n_epochs: 20
   arch: vgg
   pretrained: true
+
 random:
   num_trials: 101
   stddev: 0.1
   margin: 0.01
+
 adversarial:
   num_deep: 3
   lr: 0.0001
-  epochs: 4
+  epochs: 10
   lambda: 0.75
   critic_steps: 201
   batch_size: 64
   actor_steps: 101
   sharpness: 300.
-  margin: 0.01
+  margin: 0.02
+
 mitigating:
   n_epochs: 20
   lbda: 0.5
   batch_size: 32
+
 pruning:
   dynamic: true
   step_size: 1500
   max_steps: 10
   stop_early: true
-  batch_size: 80
-  obj_lb: 0.55
+  batch_size: 40
+  obj_lb: 0.65
+
 biasGrad:
   lr: 0.0000075
   n_epochs: 8
@@ -60,3 +68,11 @@ biasGrad:
   margin: 0.01
   n_evals: 8
   obj_lb: 0.55
+
+engineeredBiasGrad:
+  lr: 0.00001
+  n_epochs: 15
+  batch_size: 50
+  margin: 0.01
+  n_evals: 5
+  obj_lb: 0.80

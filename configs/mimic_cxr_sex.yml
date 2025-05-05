@@ -10,7 +10,7 @@ disease: Enlarged Cardiomediastinum                                   # disease 
 metric: eod
 acc_metric: balanced_accuracy
 modelpath: chestxray_mimic_enlargedCardiomediastinum_0_75_vgg
-num_workers: 2                                                        # number of worker processes for data loaders
+num_workers: 8                                                        # number of worker processes for data loaders
 
 objective:
   sharpness: 500.
@@ -23,8 +23,10 @@ models:
   - random
   - adversarial
   - mitigating
-  - pruning
   - biasGrad
+  - engineeredBiasGrad
+  - pruning
+  - adaptive_pruning
 
 default:                                                              # original model's parameters
   batch_size: 32                                                        # batch size
@@ -58,13 +60,21 @@ pruning:                                                              # pruning 
   step_size: 1500
   max_steps: 10                                                         # maximum number of steps before early stopping
   stop_early: true
-  batch_size: 80                                                        # batch size for approximating neuron influence
+  batch_size: 40                                                        # batch size for approximating neuron influence
   obj_lb: 0.65
 
 biasGrad:
   lr: 0.00001
   n_epochs: 10
-  batch_size: 32
+  batch_size: 32j
+  margin: 0.01
+  n_evals: 5
+  obj_lb: 0.75
+
+engineeredBiasGrad:
+  lr: 0.00001
+  n_epochs: 10
+  batch_size: 50
   margin: 0.01
   n_evals: 5
   obj_lb: 0.75
